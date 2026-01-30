@@ -40,7 +40,7 @@ export default function KeyboardScroll() {
                 // The list showed 001.
                 // So I'll map index 0 -> 001.
                 const paddedIndex = (i + 1).toString().padStart(3, "0");
-                img.src = `${FRAME_PATH}${paddedIndex}.jpg`;
+                img.src = `${FRAME_PATH}${paddedIndex}.webp`;
 
                 await new Promise<void>((resolve) => {
                     img.onload = () => {
