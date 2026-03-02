@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useScroll, useTransform, motion, useMotionValueEvent } from "framer-motion";
+import { useScroll, useTransform, motion, useMotionValueEvent, MotionValue } from "framer-motion";
 
 const FRAME_COUNT = 220; // Using all 220 frames as requested
 const FRAME_PATH = "/frames/frame_";
@@ -9,13 +9,12 @@ const FRAME_PATH = "/frames/frame_";
 export default function KeyboardScroll() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
-    const [images, setImages] = useState<HTMLImageElement[]>([]);
-    const [loadedCount, setLoadedCount] = useState(0);
-    const [loadError, setLoadError] = useState(false);
+    const imagesRef = useRef<(HTMLImageElement | null)[]>(new Array(FRAME_COUNT).fill(null));
+    const [isFirstFrameLoaded, setIsFirstFrameLoaded] = useState(false);
 
     // Scroll progress for the entire container
-    // Scroll progress for the entire container
     const { scrollYProgress } = useScroll({
+        target: containerRef,
         offset: ["start start", "end end"],
     });
 
@@ -23,41 +22,46 @@ export default function KeyboardScroll() {
     const frameIndex = useTransform(scrollYProgress, [0, 1], [0, FRAME_COUNT - 1]);
 
     useEffect(() => {
-        // Preload images
+        // Preload images intelligently
         const loadImages = async () => {
-            const loadedImages: HTMLImageElement[] = [];
-            let loaded = 0;
+            // First load frame 0 to unblock the UI immediately
+            const firstImg = new Image();
+            firstImg.src = `${FRAME_PATH}001.webp`;
 
-            for (let i = 0; i < FRAME_COUNT; i++) {
-                const img = new Image();
-                // Pad index to 3 digits (001, 002, etc.)
-                // Although the files are frame_001.jpg, etc.
-                // Wait, the `ls` output showed ezgif-frame-001.jpg.
-                // And I renamed them to frame_001.jpg.
-                // I need to be careful with 0-based vs 1-based.
-                // ezgif usually starts at 001.
-                // I should check if frame_000 exists or if it starts at 001.
-                // The list showed 001.
-                // So I'll map index 0 -> 001.
-                const paddedIndex = (i + 1).toString().padStart(3, "0");
-                img.src = `${FRAME_PATH}${paddedIndex}.webp`;
+            await new Promise<void>((resolve) => {
+                firstImg.onload = () => {
+                    imagesRef.current[0] = firstImg;
+                    setIsFirstFrameLoaded(true);
+                    resolve();
+                };
+                firstImg.onerror = () => resolve();
+            });
 
-                await new Promise<void>((resolve) => {
-                    img.onload = () => {
-                        loaded++;
-                        setLoadedCount(loaded);
-                        resolve();
-                    };
-                    img.onerror = () => {
-                        console.error(`Failed to load image ${i}`);
-                        // Still resolve to continue loading others? Or fatal?
-                        // If missing a few frames, might be glitchy.
-                        resolve();
-                    }
-                });
-                loadedImages.push(img);
+            // Then load the rest in batches so we don't choke the browser thread and network
+            const BATCH_SIZE = 10;
+            for (let i = 1; i < FRAME_COUNT; i += BATCH_SIZE) {
+                const batchPromises = [];
+                for (let j = 0; j < BATCH_SIZE && i + j < FRAME_COUNT; j++) {
+                    const idx = i + j;
+                    const img = new Image();
+                    const paddedIndex = (idx + 1).toString().padStart(3, "0");
+                    img.src = `${FRAME_PATH}${paddedIndex}.webp`;
+
+                    const p = new Promise<void>((resolve) => {
+                        img.onload = () => {
+                            imagesRef.current[idx] = img;
+                            resolve();
+                        };
+                        img.onerror = () => resolve();
+                    });
+                    batchPromises.push(p);
+                }
+                // Wait for the current batch to load before requesting the next
+                await Promise.all(batchPromises);
+
+                // Optional: trigger a re-render if the user is currently scrolling over a loading section
+                // But requestAnimationFrame will automatically get the latest imagesRef when scrolling
             }
-            setImages(loadedImages);
         };
 
         loadImages();
@@ -66,7 +70,7 @@ export default function KeyboardScroll() {
     // Render to canvas
     const renderFrame = (index: number) => {
         const canvas = canvasRef.current;
-        if (!canvas || images.length === 0) return;
+        if (!canvas) return;
 
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
@@ -74,23 +78,26 @@ export default function KeyboardScroll() {
         // Clamp index
         const safeIndex = Math.min(
             Math.max(Math.round(index), 0),
-            images.length - 1
+            FRAME_COUNT - 1
         );
 
-        const img = images[safeIndex];
-        if (!img) return;
+        // Find the closest loaded image if the exact frame isn't loaded yet
+        let imgToDraw = imagesRef.current[safeIndex];
+
+        if (!imgToDraw) {
+            // Search backwards for the most recent loaded frame to prevent flickering
+            for (let i = safeIndex - 1; i >= 0; i--) {
+                if (imagesRef.current[i]) {
+                    imgToDraw = imagesRef.current[i];
+                    break;
+                }
+            }
+        }
+
+        if (!imgToDraw) return;
 
         // Set canvas dimensions to match window (or parent) to avoid stretching
         // "Contain" logic
-        // We want to draw the image such that it fits within the canvas while preserving aspect ratio
-        // And the canvas itself is h-screen w-full.
-
-        // Actually, setting canvas width/height to window.innerWidth/Height gives best resolution
-        // But we need to handle resize in a separate effect or just use the existing size if already set.
-        // Ideally we set canvas.width = window.innerWidth * dpr, etc.
-
-        // Let's rely on a resize handler for the canvas buffer size.
-
         const canvasWidth = canvas.width;
         const canvasHeight = canvas.height;
 
@@ -98,7 +105,7 @@ export default function KeyboardScroll() {
         ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
         // Calculate draw dimensions for "contain"
-        const imgAspect = img.width / img.height;
+        const imgAspect = imgToDraw.width / imgToDraw.height;
         const canvasAspect = canvasWidth / canvasHeight;
 
         let drawWidth, drawHeight, offsetX, offsetY;
@@ -117,44 +124,50 @@ export default function KeyboardScroll() {
             offsetY = 0;
         }
 
-        ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+        ctx.drawImage(imgToDraw, offsetX, offsetY, drawWidth, drawHeight);
     };
 
     useMotionValueEvent(frameIndex, "change", (latest) => {
-        if (loadedCount === FRAME_COUNT) {
+        if (isFirstFrameLoaded) {
             requestAnimationFrame(() => renderFrame(latest));
         }
     });
 
     // Initial render when loading is done
     useEffect(() => {
-        if (loadedCount === FRAME_COUNT) {
+        if (isFirstFrameLoaded) {
             requestAnimationFrame(() => renderFrame(frameIndex.get()));
         }
-    }, [loadedCount, frameIndex]);
+    }, [isFirstFrameLoaded, frameIndex]);
 
     // Handle Resize
     useEffect(() => {
         const handleResize = () => {
-            if (canvasRef.current) {
+            if (canvasRef.current && isFirstFrameLoaded) {
                 canvasRef.current.width = window.innerWidth * window.devicePixelRatio;
                 canvasRef.current.height = window.innerHeight * window.devicePixelRatio;
                 // Force re-render
                 renderFrame(frameIndex.get());
             }
         }
-        handleResize();
+
+        // Initialize size
+        if (canvasRef.current && isFirstFrameLoaded) {
+            canvasRef.current.width = window.innerWidth * window.devicePixelRatio;
+            canvasRef.current.height = window.innerHeight * window.devicePixelRatio;
+            renderFrame(frameIndex.get());
+        }
+
         window.addEventListener('resize', handleResize);
         return () => window.removeEventListener('resize', handleResize);
-    }, [loadedCount]); // Re-bind if loadedCount changes? No, just renderFrame needs current index.
+    }, [isFirstFrameLoaded, frameIndex]);
 
-
-    if (loadedCount < FRAME_COUNT) {
+    if (!isFirstFrameLoaded) {
         return (
             <div className="h-screen w-full flex items-center justify-center bg-[#ECECEC] text-black/60 font-medium">
                 <div className="flex flex-col items-center gap-2">
                     <div className="w-6 h-6 border-2 border-black/20 border-t-black/80 rounded-full animate-spin"></div>
-                    <span>Loading Stratus sequence... {Math.round((loadedCount / FRAME_COUNT) * 100)}%</span>
+                    <span>Initializing Engine...</span>
                 </div>
             </div>
         );
@@ -168,15 +181,13 @@ export default function KeyboardScroll() {
                 style={{ width: "100%", height: "100vh" }}
             />
 
-            {/* Text Overlays - Positioned Absolute/Sticky over the canvas? 
-          Actually, we can use sticky elements interleaved or fixed overlays that fade in/out based on scrollYProgress.
-      */}
+            {/* Text Overlays - Positioned Absolute/Sticky over the canvas */}
             <TextOverlay scrollYProgress={scrollYProgress} />
         </div>
     );
 }
 
-function TextOverlay({ scrollYProgress }: { scrollYProgress: any }) {
+function TextOverlay({ scrollYProgress }: { scrollYProgress: MotionValue<number> }) {
     // Helper for beat visibility
     const useBeatOpacity = (start: number, peak: number, end: number) => {
         return useTransform(scrollYProgress,
